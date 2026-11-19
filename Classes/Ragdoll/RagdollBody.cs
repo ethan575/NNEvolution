@@ -1,5 +1,6 @@
 using _3D_Engine.Classes.NeuralNet;
 using Jitter2;
+using Jitter2.Dynamics;
 using Jitter2.LinearMath;
 using MathNet.Numerics.LinearAlgebra;
 using Vector3 = OpenTK.Mathematics.Vector3;
@@ -567,8 +568,15 @@ namespace _3D_Engine.Classes.Ragdoll
                 var rb = Bones[i].RB;
                 rb.Position = initialConfig.BonePositions[i];
                 rb.Orientation = initialConfig.BoneRotations[i];
-                rb.Velocity = initialConfig.BoneVelocities[i];
-                rb.AngularVelocity = initialConfig.BoneAngularVelocities[i];
+
+                // Jitter throws if velocity is assigned to a static body, and a creature
+                // authored in the builder can contain static bones.
+                if (rb.MotionType != MotionType.Static)
+                {
+                    rb.Velocity = initialConfig.BoneVelocities[i];
+                    rb.AngularVelocity = initialConfig.BoneAngularVelocities[i];
+                }
+
                 rb.Force = JVector.Zero;
                 rb.Torque = JVector.Zero;
             }

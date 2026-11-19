@@ -99,20 +99,30 @@ namespace _3D_Engine.Classes.Objects
 
         public void setVelocity(float x, float y, float z)
         {
-            velocity.X = x;
-            velocity.Y = y;
-            velocity.Z = z;
-
-            Rbody.Velocity = new JVector(x,y,z);
+            setVelocity(new Vector3(x, y, z));
         }
         public void setVelocity(Vector3 v)
         {
             velocity = v;
+
+            // Jitter throws InvalidOperationException when velocity is assigned to a static
+            // body ("Can not set velocity for static objects"), so guard every write here.
+            if (Rbody.MotionType == MotionType.Static)
+            {
+                return;
+            }
+
             Rbody.Velocity = new JVector(v.X, v.Y, v.Z);
         }
         public void changeVelociy(Vector3 v)
         {
             velocity += v;
+
+            if (Rbody.MotionType == MotionType.Static)
+            {
+                return;
+            }
+
             Rbody.Velocity += new JVector(v.X, v.Y, v.Z);
         }
 

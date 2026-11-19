@@ -27,7 +27,10 @@ namespace _3D_Engine.Classes.Scenes
         private const float MaxTargetRingExtent = 52f; // keep targets on the floor
 
         // The cube model is drawn at half scale, so its collider is built at half size too.
-        private static readonly BoxShape TargetCubeShape = new BoxShape(0.5f);
+        // This must stay a size, not a shared BoxShape instance: a RigidBodyShape remembers
+        // the body it was attached to, so a cached instance throws "Shape has already been
+        // added to a body." when the next SimulationScene is created.
+        private const float TargetCubeColliderSize = 0.5f;
 
         Game game;
 
@@ -36,8 +39,10 @@ namespace _3D_Engine.Classes.Scenes
         // jitter physics world
         List<HeadlessSimulationScene> AllSimWorlds = new List<HeadlessSimulationScene>();
         World ForegroundWorld = new World();
-        // Separate world for the target marker so no creature can collide with it.
-        World TargetWorld = new World();
+        // Separate world for the target marker so no creature can collide with it. It is
+        // stepped so the kinematic marker actually moves when a velocity is applied;
+        // kinematic bodies are only integrated by World.Step.
+        World TargetWorld = CreateTargetWorld();
 
         Shader shader;
         PhysicsServer physicsServer;
@@ -82,6 +87,8 @@ namespace _3D_Engine.Classes.Scenes
 
         public override void Update(float dt)
         {
+            ApplyTargetInput(dt);
+
             if (isSimulationRunning && PhysicsServer.AllowedWorldStep)
             {
                 int steps = simSpeedMultiplier == 1 ? 1 : simSpeedMultiplier;
@@ -116,6 +123,10 @@ namespace _3D_Engine.Classes.Scenes
                         }
                     }
 
+                    // Advance the target marker. Kinematic bodies are only integrated by
+                    // World.Step, so without this its velocity would never become movement.
+                    TargetWorld.Step(stepDt);
+
                     JVector liveTargetPos = TargetCube.Rbody.Position;
                     Parallel.For(0, AllSimWorlds.Count, i =>
                     {
@@ -138,6 +149,13 @@ namespace _3D_Engine.Classes.Scenes
             {
                 physicsServer.Update(dt, AllSimWorlds, ForegroundWorld);
                 AllSimWorlds.ForEach(s => s.ragdollBody.ResetAngularVelocities());
+
+                // Before a run starts there is no generation loop, so the target gets its
+                // own step and the arrow keys work while you are setting up.
+                if (isFirstSimulationClick && PhysicsServer.AllowedWorldStep)
+                {
+                    TargetWorld.Step(MathF.Min(dt, 1f / 60f));
+                }
             }
 
 
@@ -361,28 +379,41 @@ namespace _3D_Engine.Classes.Scenes
                 backgroundPopulationHidden = !backgroundPopulationHidden;
             }
 
-            // Manual target nudging. The marker is static now (creatures must not be able to
-            // push it), so these move it directly instead of injecting velocity - otherwise
-            // the keys silently did nothing. During a generation the schedule owns the
-            // target, so nudging is only allowed before the run starts.
-            float u = 0.5f;
+            // Manual target nudging lives in ApplyTargetInput, called at the top of Update
+            // before physics runs. Doing it here would let velocity accumulate.
+        }
 
-            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.W))
+        private static World CreateTargetWorld()
+        {
+            World world = new World();
+            // The marker is always kinematic; never let it fall asleep or the solver will
+            // stop integrating it while a nudge is being applied.
+            world.AllowDeactivation = false;
+            return world;
+        }
+
+        /// <summary>
+        /// Applies the arrow-key target nudge. The marker is kinematic, so it supports
+        /// velocity, and it is isolated in its own world, so moving it cannot shove
+        /// creatures. The velocity is set (not added to) every frame, then cleared in
+        /// <see cref="SetTargetCubePosition"/> at each phase boundary.
+        /// </summary>
+        private void ApplyTargetInput(float dt)
+        {
+            if (TargetCube == null)
             {
-                TargetCube.setPosition(TargetCube.GetPosition() + Vector3.UnitZ * u);
+                return;
             }
-            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.S))
-            {
-                TargetCube.setPosition(TargetCube.GetPosition() - Vector3.UnitZ * u);
-            }
-            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.A))
-            {
-                TargetCube.setPosition(TargetCube.GetPosition() - Vector3.UnitX * u);
-            }
-            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.D))
-            {
-                TargetCube.setPosition(TargetCube.GetPosition() + Vector3.UnitX * u);
-            }
+
+            float u = 1.5f;
+            Vector3 v = Vector3.Zero;
+
+            if (game.KeyboardState.IsKeyDown(Keys.W)) v += Vector3.UnitZ * u;
+            if (game.KeyboardState.IsKeyDown(Keys.S)) v -= Vector3.UnitZ * u;
+            if (game.KeyboardState.IsKeyDown(Keys.A)) v -= Vector3.UnitX * u;
+            if (game.KeyboardState.IsKeyDown(Keys.D)) v += Vector3.UnitX * u;
+
+            TargetCube.setVelocity(v);
         }
 
         public override void OnFrameRender(float dt)
@@ -425,9 +456,17 @@ namespace _3D_Engine.Classes.Scenes
             // creature then steered at the moved cube.
             RigidBody RB1 = TargetWorld.CreateRigidBody();
             RB1.SetMassInertia(20);
-            RB1.AddShape(TargetCubeShape);
-            RB1.MotionType = MotionType.Static;
+            RB1.AddShape(new BoxShape(TargetCubeColliderSize));
+            // Kinematic, not static: PhysicsObject.setVelocity writes Rbody.Velocity, and
+            // Jitter throws InvalidOperationException for static bodies ("Can not set
+            // velocity for static objects"). Kinematic lets the marker move freely and
+            // respond to the arrow keys, while staying immune to gravity and to being
+            // pushed by creatures.
+            RB1.MotionType = MotionType.Kinematic;
             RB1.AffectedByGravity = false;
+            // Damping is applied to kinematic bodies too, so near-zero keeps the target at
+            // whatever speed it is given. The values are Jitter's defaults, made explicit.
+            RB1.Damping = (0.002f, 0.005f);
             TargetCube = new PhysicsObject("convex1", shader, cubeVertex, this, game, RB1, new Vector3(0, 1, 0));
             // Note: the .stl is scaled 2x smaller than its collider, so the marker's visual
             // size stays what it always was on screen; only the collision extent changed.
@@ -622,9 +661,11 @@ namespace _3D_Engine.Classes.Scenes
 
         private void SetTargetCubePosition(JVector pos)
         {
-            // Teleport-only marker: static bodies accept direct position writes and update
-            // the broadphase, so the cube can never be pushed off its scheduled point.
-            TargetCube.Rbody.MotionType = MotionType.Static;
+            // Teleport the marker to the scheduled point and stop it dead, so each phase
+            // starts from the same state. It stays kinematic and is teleported rather than
+            // allowed to wander, so it can never drift off the point that is scored, and
+            // creatures still cannot push it.
+            TargetCube.Rbody.MotionType = MotionType.Kinematic;
             TargetCube.setPosition(pos.X, pos.Y, pos.Z);
             TargetCube.setVelocity(Vector3.Zero);
             TargetCube.Rbody.AngularVelocity = JVector.Zero;
