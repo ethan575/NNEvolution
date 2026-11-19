@@ -1,0 +1,49 @@
+﻿speed up trainining
+
+private int simSpeedMultiplier = 1; // e.g. cycles 1 -> 10 -> 30
+
+	if (game.KeyboardState.IsKeyPressed(Keys.F))
+{
+    simSpeedMultiplier = simSpeedMultiplier == 1 ? 10 : (simSpeedMultiplier == 10 ? 30 : 1);
+    game.VSync = simSpeedMultiplier == 1
+        ? OpenTK.Windowing.Common.VSyncMode.On
+        : OpenTK.Windowing.Common.VSyncMode.Off;
+}
+
+reset game.VSync = OpenTK.Windowing.Common.VSyncMode.On; inside destroyScene() so leaving for BuildScene restores VSync.
+
+
+If isSimulationRunning && PhysicsServer.AllowedWorldStep:
+Decide step count and step size:
+
+At 1×: steps = 1, stepDt = MathF.Min(dt, 1f / 30f)
+At > 1×: steps = simSpeedMultiplier, stepDt = 1f / 60f
+
+Loop for (int step = 0; step < steps; step++):
+Subtract stepDt from currentGeneration.ActiveTimeLeft.
+If currentGeneration.ActiveTimeLeft <= 0, call PrepareEndGeneration(); and break; out of the loop (so the window still renders and stays responsive between generations).
+
+Check the 4-phase switch (desiredPhase != currentPhaseIndex → SetTargetCubePosition(nextTarget) + BeginTargetPhase(nextTarget)).
+Read the target's live physics position directly from TargetCube.Rbody.Position (important: TargetCube.GetPosition() only refreshes when PhysicsObject.Update runs at the end of the frame, whereas Rbody.Position is always up to date inside the substep loop).
+Update all 50 creatures' brains and step all 50 isolated Jitter2 worlds in parallel:
+csharp
+
+JVector liveTargetPos = TargetCube.Rbody.Position;
+Parallel.For(0, AllSimWorlds.Count, i =>
+{
+    var scene = AllSimWorlds[i];
+    scene.ragdollBody.AdvanceSimulationClock(stepDt);
+    scene.ragdollBody.TargetPosition = liveTargetPos;
+    var inputM = scene.ragdollBody.GetBrainInputMatrix();
+    scene.ragdollBody.BrainNNFF(inputM);
+    scene.world.Step(stepDt);
+});
+After the substep loop finishes for that frame, run:
+csharp
+
+foreach (var obj in AllPhysicsObjects)
+{
+    obj.Update(dt);
+}
+(instead of calling physicsServer.Update(...) at the top when isSimulationRunning && PhysicsServer.AllowedWorldStep, otherwise physics would step twice).
+When !isSimulationRunning || !PhysicsServer.AllowedWorldStep, keep calling physicsServer.Update(dt, AllSimWorlds, ForegroundWorld); as before.
