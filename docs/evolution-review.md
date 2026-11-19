@@ -1,5 +1,11 @@
 # Review of the evolution / fitness code
 
+> **Status: the findings below have been implemented.** See
+> [Changes applied](#changes-applied) at the end for what was changed, and
+> [Verification](#verification-after-the-change) for the re-measured fitness landscape.
+> Sections 1–3 and 5–9 are fixed; the items left alone are listed under
+> [Not changed](#not-changed-and-why) with reasons.
+
 Scope: `NeuralNet/FitnessEval.cs`, `NeuralNet/NNTrainer.cs`, `Ragdoll/RagdollBody.cs`,
 `Scenes/SimulationScene.cs`, `Scenes/HeadlessSimulation.cs`, `Ragdoll/Joint.cs`.
 
@@ -420,3 +426,178 @@ elite/tournament/Gaussian-mutation operators. §3–§10 are read directly off t
 and cross-checked against Jitter2 2.8.8 (`IBroadPhaseFilter`, `HingeAngle`, `BoxShape`,
 `JVector.Transform`). The project has not been compiled or run here (no .NET SDK, and
 it targets `net9.0-windows`).
+
+---
+
+# Changes applied
+
+Every change below is on this branch. Rewards and geometries are the ones in
+`FitnessEval.cs`, `RagdollBody.cs` and `SimulationScene.cs`.
+
+## 1. Fitness is now relative and arrival-dominated
+
+`FitnessEval.cs`, `RagdollBody.cs`
+
+- `EvalMultiPhaseTargetFollowing` scores `PhaseProgressMeters[i] / PhaseStartDistances[i]`,
+  clamped to `[-1, +1]`, instead of raw metres.
+- The `2.0 * minPosBonus` term is **gone**. It was not a direction measure — it paid a
+  creature for never having a bad phase, which a straight-line walker gets for free.
+- Arrival is now `4 * PhasesReachedCount`, so one arrival outweighs several phases of
+  perfect-but-unfinished tracking.
+- Progress is credited on the **closest approach** during a phase, not the end-of-phase
+  position, so reaching the target and overshooting is a success rather than a
+  penalty. (Scoring the end position punished exactly the speed we want.)
+- New `RagdollBody.PhaseStartDistances` records the distance at phase start.
+- The no-phase fallback path is `3 * relative` instead of `20 * relative`, so an
+  interrupted generation can no longer score ~20× its real value.
+
+## 2. The task is now reachable
+
+`SimulationScene.cs`
+
+- Target ring reduced from `32..46` to `12..18` units
+  (`TargetRingMinRadius` / `TargetRingMaxRadius`), so arrivals are physically possible
+  inside a 6.67 s phase instead of needing ~8.6 m/s from a standing start.
+- Clamping is now **radial**: the offset *length* is clamped against
+  `MaxTargetRingExtent - max(|centre.X|, |centre.Z|)` instead of clamping X and Z
+  independently. Previously an off-centre spawn gave some world directions a shorter
+  target, which is a stochastic reward for facing one way.
+
+## 3. The target can no longer be pushed, and is out of the creatures' world
+
+`SimulationScene.cs`
+
+- The target marker moved into its own `World` (`TargetWorld`), so no creature can
+  collide with or block it.
+- It is `MotionType.Static`, not `Dynamic`, and gravity is disabled, so the value the
+  network steers at and the value the phase is scored against cannot drift apart.
+- Its collider is built from a static `BoxShape(0.5f)` and the visual is scaled `0.25f`,
+  so the on-screen marker stays the size it always was (the old code added a `BoxShape(1)`
+  but drew the cube at half scale).
+- `destroyScene` clears and disposes `TargetWorld`.
+- Arrow-key nudging of the target now moves the static body directly
+  (`setPosition`) and only works before a run starts. Previously it injected velocity,
+  which is meaningless for a static body and would have silently desynchronised the
+  population mid-generation.
+
+## 4. Self-collision only ignores joint-adjacent bones
+
+`HeadlessSimulation.cs`
+
+- `RagdollSelfCollisionFilter` now takes `(bones, joints)` and rejects only pairs that
+  share a hinge. Previously it rejected *every* same-creature pair, so limbs passed
+  through the torso and evolution could exploit it.
+
+## 5. The network gets a stable body frame
+
+`RagdollBody.cs`
+
+- `Bones[0]` (whichever bone the `.creature` file listed first) is replaced by
+  `ComputeBodyFrameOrientation()`: yaw taken from the "head" bone (highest above the
+  COM), world up as the secondary axis, roll zeroed. Returns `JQuaternion.Identity` when
+  the creature has no vertical extent. This keeps the yaw sign consistent across
+  creatures and across save orderings.
+- The distance input is normalised by the phase's starting distance instead of a fixed
+  `/30f` that was saturated at `1.0` for the entire generation.
+
+## 6. The fitness graph actually plots the data
+
+`UiManager.cs`
+
+- `ref FitnessGraphValues.ToArray()[0]` → a persistent `float[]` buffer filled each
+  frame, so ImGui reads live data instead of a temporary.
+- The hardcoded `scale_min: 0, scale_max: 100` is replaced by a range computed from the
+  buffer, including negatives (the new objective can go below zero when a creature walks
+  away from its targets), with 10% padding.
+
+## 7. Selection: elites out of the breeding pool, gentler mutation
+
+`NNTrainer.cs`
+
+- The parent pool now **excludes the elites** (`poolSize = sorted.Count - eliteCount`,
+  plus an `offset` argument in `SelectTournamentIndex`). Elites are still copied
+  verbatim; they simply no longer also supply most of the offspring.
+- Mutation sigma reduced on the fitter offspring (`0.05 / 0.12 / 0.30` at rates
+  `0.15 / 0.20 / 0.30`) — the old `0.08 / 0.18 / 0.35` were large steps relative to a
+  noisy per-generation score.
+- Removed the WinForms-designer `using` leftovers.
+
+## 8. Fitness is comparable across generations
+
+`NNTrainer.cs`, `SimulationScene.cs`
+
+- New `TargetScheduleBank`: a fixed set of 3 schedules pinned for 10 generations, then
+  rotated. The scene supplies the generator (it owns the geometry and spawn point) and
+  `NNTrainer.NextScheduleBank` owns the rotation.
+- `NNTrainer.Generations` is now actually appended to (capped at 50) and `LatestGen` is
+  still written, so there is an inspectable history.
+- `Generation.Copy()` preserves `FitnessScore` and `ActiveTimeLeft`.
+
+## 9. Reward plumbing fixes
+
+- `EvalEnergyUsed` takes a step count and normalises by mean effort per control step;
+  `RagdollBody.ControlSteps` counts them. Previously `1/(1+EnergyUsed)` was identically
+  ~0 once summed over ~1200 substeps per phase.
+- `TimeToReachTarget` is per-phase (`clock - phaseStartClock`) instead of cumulative, and
+  `phaseReached`/`phaseClock`/`PhaseTimesToReach` now restart each phase, so
+  `EvalTimeTaken` describes the phase it is scoring.
+- Removed `Objectives.MaxDistanceFromPopulation` (written, never read) and the dead
+  `if (Objectives...)` block in `EndOfGenerationTasks`.
+- `Genome` biases are cloned in `ExecuteEndOfGenerationTasks`; they used to alias the
+  live `LayerBias` matrices.
+
+## 10. Training speed
+
+`Bone.cs`
+
+- `bone.stl` is parsed once and the scaled point cloud is cached per visual scale. It used
+  to be re-read from disk and re-parsed per bone per clone — 49 clones per generation.
+
+---
+
+# Verification after the change
+
+Re-ran the Monte-Carlo replication against the **new** objective and the **new**
+`12..18` ring (1200 generations per cell, per-phase arrival credit, closest-approach
+scoring):
+
+| policy | v=1.0 | v=1.5 | v=2.0 | v=3.0 | v=5.0 |
+|---|---|---|---|---|---|
+| fixed direction, no turning | 2.68 | 2.76 | 2.07 | 1.73 | 1.17 |
+| tracker, 30 °/s | 2.88 | 4.05 | 5.22 | 8.70 | 10.45 |
+| tracker, 60 °/s | 3.58 | 5.43 | 7.10 | 11.80 | 14.37 |
+| tracker, 180 °/s | 4.31 | 6.51 | 8.90 | 14.29 | 14.97 |
+
+Compared with the old objective, where a fixed-direction walker scored `+1.20` at
+1 m/s and `-38.86` at 6 m/s:
+
+- **Mixing now pays monotonically.** Any policy that uses the target direction earns more
+  the faster it goes, at every turning authority.
+- **The straight-line walker is capped.** It plateaus at ~2.7 and slightly *declines* with
+  speed, so the treadmill basin is gone — but it is not punished into a different dead
+  end.
+- **The gradient points at steering.** At every speed the ordering is
+  straight < 30 °/s < 60 °/s < 180 °/s, so there is a slope to climb toward turning
+  rather than a ridge to cross blindly.
+
+Caveat: this models locomotion as a unicycle with bounded turn rate. It validates the
+*shape* of the reward, not the physics of your ragdolls. The project was not compiled or
+run here (no .NET SDK in this sandbox; the target framework is `net9.0-windows`), so the
+C# itself has only been checked by reading, by a brace/paren balance pass, and by
+cross-checking every Jitter2 member used (`MotionType`, `BoxShape`, `JVector.Cross`,
+`JQuaternion.Identity`, `PointCloudShape`, `IBroadPhaseFilter`, `HingeAngle`) against the
+2.8.8 source.
+
+# Not changed, and why
+
+- **Joint motor force (400/800 N·m).** Raising or lowering it changes the gaits available
+  and should be tuned against a real run, not guessed. Worth logging motor saturation
+  first — if most steps are at the ±45° limit, the network's fine output is being thrown
+  away.
+- **`NeuralNet/NeuralNetwork - extras.cs`.** Dead duplicate class. Deleting it is safe but
+  it is unrelated to the symptom and the file is excluded from nothing, so it stays.
+- **The mirrored-X question** (`(-x,y,z,-w)` quaternions, `-position.X` translation,
+  `Camera.Right = (-1,0,0)`). Still unverified — it needs a running build and one look at
+  the console output of `P` versus the screen. Nothing in the evolution code depends on it.
+- **`PhysicsObject.FromJquaternion`.** Cosmetic (rendered orientation ≠ simulated
+  orientation) and risky to change blind.

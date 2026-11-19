@@ -164,7 +164,17 @@ namespace _3D_Engine.Classes.NeuralNet
             {
                 clonedWeights.Add(weight.Clone());
             }
-            genome = new Genome(clonedWeights, ConstructBiasList());
+
+            // Biases must be cloned as well. ConstructBiasList returns the live LayerBias
+            // matrices, so the genome used to alias the network and any future crossover
+            // driven from the genome would have silently corrupted its parents.
+            List<Matrix<float>> clonedBiases = new List<Matrix<float>>();
+            foreach (var bias in ConstructBiasList())
+            {
+                clonedBiases.Add(bias.Clone());
+            }
+
+            genome = new Genome(clonedWeights, clonedBiases);
         }
 
         public void ExecuteStartOfGenerationTasks()

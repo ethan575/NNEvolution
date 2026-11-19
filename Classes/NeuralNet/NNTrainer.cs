@@ -1,10 +1,29 @@
+using Jitter2.LinearMath;
 using MathNet.Numerics.LinearAlgebra;
-using System;
-using static System.ComponentModel.Design.ObjectSelectorEditor;
-using static System.Windows.Forms.AxHost;
 
 namespace _3D_Engine.Classes.NeuralNet
 {
+    /// <summary>
+    /// A fixed set of target schedules that is shared by a whole generation.
+    /// Resampling the targets every generation made scores incomparable between
+    /// generations, so the best-fitness curve could not distinguish "no progress"
+    /// from "a different, harder task". One bank is pinned for <see cref="GenerationsPerBank"/>
+    /// generations, then rotated.
+    /// </summary>
+    public sealed class TargetScheduleBank
+    {
+        public const int GenerationsPerBank = 10;
+        public const int SchedulesPerBank = 3;
+
+        public int BankId { get; }
+        public JVector[][] Schedules { get; }
+
+        public TargetScheduleBank(int bankId, JVector[][] schedules)
+        {
+            BankId = bankId;
+            Schedules = schedules;
+        }
+    }
 
     public class Generation
     {
@@ -25,9 +44,14 @@ namespace _3D_Engine.Classes.NeuralNet
             List<NeuralNetwork> newPopulation = new List<NeuralNetwork>();
             foreach (var nn in Population)
             {
-                newPopulation.Add(nn.Copy());
+                NeuralNetwork copy = nn.Copy();
+                copy.FitnessScore = nn.FitnessScore; // keep history scores inspectable
+                newPopulation.Add(copy);
             }
-            return new Generation(newPopulation);
+
+            Generation copyGen = new Generation(newPopulation);
+            copyGen.ActiveTimeLeft = ActiveTimeLeft;
+            return copyGen;
         }
     }
 
@@ -77,10 +101,38 @@ namespace _3D_Engine.Classes.NeuralNet
         public static List<Generation> Generations = new List<Generation>();
         public static Generation? LatestGen;
 
+        public static TargetScheduleBank? CurrentBank { get; private set; }
+        private static int bankGenerationCount = 0;
+        private static int nextBankId = 0;
+
+        /// <summary>
+        /// Returns the schedule bank to evaluate the next generation on, rotating it every
+        /// <see cref="TargetScheduleBank.GenerationsPerBank"/> generations. The scene
+        /// supplies the generator because it owns the target geometry and spawn point.
+        /// </summary>
+        public static TargetScheduleBank NextScheduleBank(TargetScheduleBank? current, Func<JVector[][]> generator)
+        {
+            if (current == null || bankGenerationCount >= TargetScheduleBank.GenerationsPerBank)
+            {
+                bankGenerationCount = 0;
+                CurrentBank = new TargetScheduleBank(nextBankId++, generator());
+                return CurrentBank;
+            }
+
+            CurrentBank = current;
+            return current;
+        }
+
+        public static void CountEvaluatedGeneration()
+        {
+            bankGenerationCount++;
+        }
+
         private static List<NeuralNetwork> EliteNNs = new List<NeuralNetwork>();
         private static List<NeuralNetwork> NewNNs = new List<NeuralNetwork>();
 
         private const float DefaultMutationRate = 0.2f;
+        private const int MaxGenerationsKept = 50;
 
         public static Generation EvolveGeneration(List<NeuralNetwork> population, int NoEliteNNs = 8)
         {
@@ -105,8 +157,11 @@ namespace _3D_Engine.Classes.NeuralNet
 
             if (offspringCount > 0)
             {
-                //int poolSize = Math.Clamp(Math.Max(eliteCount, sorted.Count / 4), 1, sorted.Count);
-                int poolSize = Math.Clamp(Math.Max(eliteCount, sorted.Count / 2), 1, sorted.Count);
+                // Parents are drawn from a pool that EXCLUDES the elites. Elites are already
+                // copied verbatim into the next generation, so letting them back into the
+                // breeding pool means roughly 30 of 50 slots were near-duplicates of the top
+                // 8 and effective diversity was far lower than the population size suggested.
+                int poolSize = sorted.Count - eliteCount;
                 int immigrantCount = offspringCount >= 10 ? 5 : 0;
                 int tunableCount = offspringCount - immigrantCount;
                 int crossoverCount = poolSize >= 2 ? Math.Min(Math.Max(0, tunableCount / 6), tunableCount) : 0;
@@ -123,13 +178,13 @@ namespace _3D_Engine.Classes.NeuralNet
                     }
 
                     NeuralNetwork child;
-                    if (i < crossoverCount)
+                    if (i < crossoverCount && poolSize >= 2)
                     {
-                        int p1 = SelectTournamentIndex(poolSize, tournamentSize: 3);
+                        int p1 = SelectTournamentIndex(eliteCount, poolSize, tournamentSize: 3);
                         int p2;
                         do
                         {
-                            p2 = SelectTournamentIndex(poolSize, tournamentSize: 3);
+                            p2 = SelectTournamentIndex(eliteCount, poolSize, tournamentSize: 3);
                         } while (p2 == p1 && poolSize > 1);
 
                         child = NeuronCrossover(sorted[p1], sorted[p2]);
@@ -138,19 +193,23 @@ namespace _3D_Engine.Classes.NeuralNet
                     }
                     else
                     {
-                        int parentIdx = SelectTournamentIndex(poolSize, tournamentSize: 3);
+                        int parentIdx = SelectTournamentIndex(eliteCount, poolSize, tournamentSize: 3);
                         child = sorted[parentIdx].Copy();
 
                         int mutIdx = i - crossoverCount;
                         int mutSpan = Math.Max(1, tunableCount - crossoverCount);
                         float frac = (float)mutIdx / mutSpan;
 
+                        // Roughly 400 weights are edited per child at rate 0.2, so the old
+                        // 0.18/0.35 sigmas were very large steps relative to the noise in a
+                        // per-generation fitness. Smaller steps on the fitter half of the
+                        // offspring, with a few genuinely exploratory children at the tail.
                         if (frac < 0.35f)
-                            MutateNetwork(child, rate: 0.20f, sigma: 0.08f);
+                            MutateNetwork(child, rate: 0.15f, sigma: 0.05f);
                         else if (frac < 0.80f)
-                            MutateNetwork(child, rate: 0.25f, sigma: 0.18f);
+                            MutateNetwork(child, rate: 0.20f, sigma: 0.12f);
                         else
-                            MutateNetwork(child, rate: 0.30f, sigma: 0.35f);
+                            MutateNetwork(child, rate: 0.30f, sigma: 0.30f);
                     }
 
                     child.ExecuteEndOfGenerationTasks();
@@ -165,7 +224,16 @@ namespace _3D_Engine.Classes.NeuralNet
             Generation newGen = new Generation(nextPopulation);
             population.ForEach(nn => nn.FitnessScore = 0); // reset old fitness scores
 
+            // Keep the history: Generations was declared but never written to, so there was
+            // no way to inspect or roll back to an earlier population.
+            Generations.Add(newGen.Copy());
+            if (Generations.Count > MaxGenerationsKept)
+            {
+                Generations.RemoveAt(0);
+            }
+
             LatestGen = newGen;
+            CountEvaluatedGeneration();
             return newGen;
         }
 
@@ -177,13 +245,14 @@ namespace _3D_Engine.Classes.NeuralNet
             return variant;
         }
 
-        // Select an index in [0, poolSize) biased toward earlier (fitter) entries in sorted list
-        private static int SelectTournamentIndex(int poolSize, int tournamentSize)
+        // Select an index into `sorted`, looking only at [offset, offset + poolSize), and
+        // biased toward earlier (fitter) entries.
+        private static int SelectTournamentIndex(int offset, int poolSize, int tournamentSize)
         {
-            int best = rng.Next(poolSize);
+            int best = offset + rng.Next(poolSize);
             for (int t = 1; t < tournamentSize; t++)
             {
-                int candidate = rng.Next(poolSize);
+                int candidate = offset + rng.Next(poolSize);
                 if (candidate < best)
                     best = candidate;
             }

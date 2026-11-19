@@ -45,18 +45,27 @@ namespace _3D_Engine.Classes.Ragdoll
         public JVector COMPosition { get; private set; } = JVector.Zero;
 
         public float EnergyUsed = 0;
+        public int ControlSteps = 0;
         public float TimeToReachTarget = 0;
         public bool reached = false;
 
         public JVector initialPos;
 
         public List<float> PhaseProgressMeters { get; } = new List<float>();
+        // Distance to the phase target when the phase started. Progress is scored relative
+        // to this, which makes the reward speed-independent.
+        public List<float> PhaseStartDistances { get; } = new List<float>();
+        public List<float> PhaseTimesToReach { get; } = new List<float>();
         public int PhasesReachedCount { get; private set; } = 0;
 
         private JVector phaseStartPos = JVector.Zero;
         private JVector phaseTargetPos = JVector.Zero;
         private bool hasActivePhase = false;
         private float phaseMinHorizontalDist = float.MaxValue;
+        private bool phaseReached = false;
+        private float phaseClock = 0f;
+        private float phaseStartClock = 0f;
+        private float phaseStartDist = 0f;
 
         private float period = 1.5f; // period of the sine wave for the clock input
 
@@ -65,7 +74,7 @@ namespace _3D_Engine.Classes.Ragdoll
         public FitnessObjective[] fitnessObjectives = new FitnessObjective[]
         {
             new FitnessObjective(1f, ragdoll => Objectives.EvalMultiPhaseTargetFollowing(ragdoll)),
-            new FitnessObjective(0f, ragdoll => Objectives.EvalEnergyUsed(ragdoll.EnergyUsed)),
+            new FitnessObjective(0f, ragdoll => Objectives.EvalEnergyUsed(ragdoll.EnergyUsed, ragdoll.ControlSteps)),
             new FitnessObjective(0.5f, ragdoll => Objectives.EvalTimeTaken(ragdoll.TimeToReachTarget, ragdoll.reached))
         };
 
@@ -168,6 +177,14 @@ namespace _3D_Engine.Classes.Ragdoll
             COMPosition = ComputeCentreOfMass();
             phaseStartPos = COMPosition;
             phaseMinHorizontalDist = HorizontalDistance(phaseStartPos, phaseTargetPos);
+
+            // Per-phase bookkeeping: arrival and timing have to restart with each phase,
+            // otherwise "time to reach target" is cumulative and only ever describes phase 1.
+            phaseReached = false;
+            phaseClock = 0f;
+            phaseStartClock = clock;
+            phaseStartDist = phaseMinHorizontalDist;
+
             hasActivePhase = true;
         }
 
@@ -178,12 +195,33 @@ namespace _3D_Engine.Classes.Ragdoll
             COMPosition = ComputeCentreOfMass();
             float startDist = HorizontalDistance(phaseStartPos, phaseTargetPos);
             float endDist = HorizontalDistance(COMPosition, phaseTargetPos);
-            float progressMeters = startDist - endDist;
+
+            // Credit the *closest approach* rather than the end-of-phase position. A
+            // creature that reaches the target and then carries on past it has succeeded at
+            // "get to the target", and scoring the end position instead punished any
+            // creature that overshoots - i.e. it punished exactly the speed we want.
+            float bestDist = MathF.Min(endDist, phaseMinHorizontalDist);
+            float progressMeters = startDist - bestDist;
 
             PhaseProgressMeters.Add(progressMeters);
-            if (endDist <= ArrivalRadius || phaseMinHorizontalDist <= ArrivalRadius)
+            PhaseStartDistances.Add(startDist);
+
+            bool phaseArrived = bestDist <= ArrivalRadius;
+            if (phaseArrived)
             {
                 PhasesReachedCount++;
+                phaseReached = true;
+                // Time to reach the *first* target of the generation, measured in seconds.
+                if (!reached)
+                {
+                    TimeToReachTarget = phaseClock;
+                    reached = true;
+                }
+                PhaseTimesToReach.Add(phaseClock);
+            }
+            else
+            {
+                PhaseTimesToReach.Add(0f);
             }
 
             hasActivePhase = false;
@@ -201,8 +239,12 @@ namespace _3D_Engine.Classes.Ragdoll
             BodyVelocity = ComputeVelocity();
             Matrix<float> inputMatrix = Matrix<float>.Build.Dense(Brain.LayerDims[0], 1);
 
-            JQuaternion refOrientation = Bones.Count > 0 ? Bones[0].RB.Orientation : JQuaternion.Identity;
-            JQuaternion invRefOrientation = JQuaternion.Conjugate(refOrientation);
+            // A dedicated body frame, not Bones[0]. Bones[0] is whichever bone happened to
+            // be first in the .creature file, so the meaning of "forward" flipped with its
+            // roll and could change between saves. This frame is aligned to the "head"
+            // (highest bone above the COM) with world up as a stable secondary axis, which
+            // keeps the yaw sign consistent for every creature.
+            JQuaternion invRefOrientation = JQuaternion.Conjugate(ComputeBodyFrameOrientation());
 
             // Joint angles & angular velocities
             for (int i = 0; i < Joints.Count; i++)
@@ -238,8 +280,13 @@ namespace _3D_Engine.Classes.Ragdoll
             inputMatrix[lastWrittenIdx + 7, 0] = float.IsFinite(localUp.Y) ? localUp.Y : 1f;
             inputMatrix[lastWrittenIdx + 8, 0] = float.IsFinite(localUp.Z) ? localUp.Z : 0f;
 
-            // Distance to target (0 at target, saturates at 1 for >= 30 units away)
-            inputMatrix[lastWrittenIdx + 9, 0] = float.IsFinite(dist) ? Math.Clamp(dist / 30f, 0f, 1f) : 1f;
+            // Distance to target, normalised by the phase's starting distance.
+            // This used to be a fixed /30f divisor, but the targets sat 32-46 units away so
+            // the input was pinned at 1.0 for the whole generation and carried nothing.
+            float distanceReference = phaseStartDist > 1f ? phaseStartDist : 50f;
+            inputMatrix[lastWrittenIdx + 9, 0] = float.IsFinite(dist)
+                ? Math.Clamp(dist / distanceReference, 0f, 1f)
+                : 1f;
 
             // Sin / cos periodic clock
             inputMatrix[lastWrittenIdx + 10, 0] = MathF.Sin(2f * MathF.PI * clock / period);
@@ -261,18 +308,25 @@ namespace _3D_Engine.Classes.Ragdoll
 
             COMPosition = ComputeCentreOfMass();
             float horizontalDist = HorizontalDistance(COMPosition, TargetPosition);
+            ControlSteps++;
             if (hasActivePhase)
             {
                 phaseMinHorizontalDist = MathF.Min(phaseMinHorizontalDist, horizontalDist);
+
+                // Per-phase arrival is recorded in FinalizeCurrentPhase so that every phase
+                // reports its own time (and only counts as reached if it really was).
+                if (!phaseReached && horizontalDist <= ArrivalRadius)
+                {
+                    phaseReached = true;
+                    phaseClock = clock - phaseStartClock;
+                }
             }
 
-            // Record first time the creature reaches the target, but keep the brain active
-            // so it continues balancing and following if the target moves.
+            // Keep the brain active after arriving so it continues balancing and following.
             if (!reached && horizontalDist <= ArrivalRadius)
             {
-                TimeToReachTarget = clock;
+                TimeToReachTarget = clock - phaseStartClock;
                 reached = true;
-                Console.WriteLine("Reached target in: " + TimeToReachTarget + " seconds");
             }
 
             Matrix<float> output = Brain.GetNetworkOutput(input);
@@ -286,6 +340,126 @@ namespace _3D_Engine.Classes.Ragdoll
                 Joints[i].HindgeJointConstraint.Motor.TargetVelocity = t;
                 EnergyUsed += MathF.Abs(o);
             }
+        }
+
+        /// <summary>
+        /// Builds a stable locomotion frame for the proprioceptive inputs.
+        /// Yaw is taken from the "head" (the bone furthest above the centre of mass), pitch is
+        /// derived from world up, and roll is zeroed so the frame cannot spin around the
+        /// head-tail axis. Returns identity when the creature has no vertical extent.
+        /// </summary>
+        private JQuaternion ComputeBodyFrameOrientation()
+        {
+            if (Bones == null || Bones.Count == 0)
+            {
+                return JQuaternion.Identity;
+            }
+
+            // COM is refreshed by the caller immediately before this is used.
+            int headIdx = 0;
+            float bestHeight = float.MinValue;
+            for (int i = 0; i < Bones.Count; i++)
+            {
+                float dy = Bones[i].RB.Position.Y - COMPosition.Y;
+                if (dy > bestHeight)
+                {
+                    bestHeight = dy;
+                    headIdx = i;
+                }
+            }
+
+            if (bestHeight < 0.05f)
+            {
+                return JQuaternion.Identity;
+            }
+
+            JVector up = JVector.UnitY;
+            JVector forward = Bones[headIdx].RB.Position - COMPosition;
+            forward.Y = 0f;
+
+            if (forward.LengthSquared() < 1e-6f || !IsFinite(forward))
+            {
+                // Creature is standing upright, so its heading is undefined: fall back to
+                // the head bone's own forward axis, flattened.
+                forward = JVector.Transform(JVector.UnitX, Bones[headIdx].RB.Orientation);
+                forward.Y = 0f;
+            }
+
+            if (forward.LengthSquared() < 1e-6f || !IsFinite(forward))
+            {
+                return JQuaternion.Identity;
+            }
+
+            JVector.NormalizeInPlace(ref forward);
+            JVector right = JVector.Cross(up, forward);
+            if (right.LengthSquared() < 1e-6f || !IsFinite(right))
+            {
+                return JQuaternion.Identity;
+            }
+            JVector.NormalizeInPlace(ref right);
+
+            return QuaternionFromAxes(right, up, forward);
+        }
+
+        private static bool IsFinite(JVector v)
+        {
+            return float.IsFinite(v.X) && float.IsFinite(v.Y) && float.IsFinite(v.Z);
+        }
+
+        /// <summary>
+        /// Converts an orthonormal basis whose columns are (right, up, forward) into a
+        /// quaternion. Written as an explicit matrix so it cannot depend on the axis
+        /// convention of whichever maths library is in play.
+        /// </summary>
+        private static JQuaternion QuaternionFromAxes(JVector right, JVector up, JVector forward)
+        {
+            float m00 = right.X, m01 = up.X, m02 = forward.X;
+            float m10 = right.Y, m11 = up.Y, m12 = forward.Y;
+            float m20 = right.Z, m21 = up.Z, m22 = forward.Z;
+
+            float trace = m00 + m11 + m22;
+            float x, y, z, w;
+
+            if (trace > 0f)
+            {
+                float s = MathF.Sqrt(trace + 1f) * 2f;
+                w = 0.25f * s;
+                x = (m21 - m12) / s;
+                y = (m02 - m20) / s;
+                z = (m10 - m01) / s;
+            }
+            else if (m00 > m11 && m00 > m22)
+            {
+                float s = MathF.Sqrt(1f + m00 - m11 - m22) * 2f;
+                w = (m21 - m12) / s;
+                x = 0.25f * s;
+                y = (m01 + m10) / s;
+                z = (m02 + m20) / s;
+            }
+            else if (m11 > m22)
+            {
+                float s = MathF.Sqrt(1f + m11 - m00 - m22) * 2f;
+                w = (m02 - m20) / s;
+                x = (m01 + m10) / s;
+                y = 0.25f * s;
+                z = (m12 + m21) / s;
+            }
+            else
+            {
+                float s = MathF.Sqrt(1f + m22 - m00 - m11) * 2f;
+                w = (m10 - m01) / s;
+                x = (m02 + m20) / s;
+                y = (m12 + m21) / s;
+                z = 0.25f * s;
+            }
+
+            float len = MathF.Sqrt(x * x + y * y + z * z + w * w);
+            if (len < 1e-6f)
+            {
+                return JQuaternion.Identity;
+            }
+
+            return new JQuaternion(x / len, y / len, z / len, w / len);
         }
 
         public void AddBone(Bone bone)
@@ -368,6 +542,7 @@ namespace _3D_Engine.Classes.Ragdoll
             };
             clonedRagdoll.initialPos = initialConfig.COMPosition;
             clonedRagdoll.clock = clock;
+            clonedRagdoll.ControlSteps = 0;
             clonedRagdoll.TargetPosition = TargetPosition;
             if (this.Brain != null)
             {
@@ -380,12 +555,6 @@ namespace _3D_Engine.Classes.Ragdoll
         {
             FinalizeCurrentPhase();
             Brain.ExecuteEndOfGenerationTasks();
-
-            var dist = (this.TargetPosition - this.ComputeCentreOfMass()).Length();
-            if (Objectives.MaxDistanceFromPopulation < dist)
-            {
-                Objectives.MaxDistanceFromPopulation = dist;
-            }
         }
 
         public void reset()
@@ -409,15 +578,22 @@ namespace _3D_Engine.Classes.Ragdoll
             }
             clock = 0f;
             EnergyUsed = 0f;
+            ControlSteps = 0;
             COMPosition = ComputeCentreOfMass();
             BodyVelocity = ComputeVelocity();
             initialPos = initialConfig.COMPosition;
             TimeToReachTarget = 0f;
             reached = false;
             PhaseProgressMeters.Clear();
+            PhaseStartDistances.Clear();
+            PhaseTimesToReach.Clear();
             PhasesReachedCount = 0;
             hasActivePhase = false;
             phaseMinHorizontalDist = float.MaxValue;
+            phaseReached = false;
+            phaseClock = 0f;
+            phaseStartClock = 0f;
+            phaseStartDist = 0f;
         }
 
     }

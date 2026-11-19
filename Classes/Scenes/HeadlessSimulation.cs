@@ -8,18 +8,36 @@ namespace _3D_Engine.Classes.Scenes
 {
     public sealed class RagdollSelfCollisionFilter : IBroadPhaseFilter
     {
-        private readonly HashSet<RigidBody> ragdollBodies;
+        // Only bones that share a hinge are allowed to interpenetrate. The previous
+        // version disabled *every* same-creature pair, so limbs passed straight through
+        // the torso and evolution was free to exploit that.
+        private readonly HashSet<long> adjacentPairs = new HashSet<long>();
 
-        public RagdollSelfCollisionFilter(IEnumerable<Bone> bones)
+        public RagdollSelfCollisionFilter(IEnumerable<Bone> bones, IEnumerable<Joint> joints)
         {
-            ragdollBodies = bones.Select(b => b.RB).ToHashSet();
+            foreach (Joint joint in joints)
+            {
+                if (joint.BoneA == null || joint.BoneB == null)
+                {
+                    continue;
+                }
+
+                adjacentPairs.Add(PairKey(joint.BoneA.RB, joint.BoneB.RB));
+            }
+        }
+
+        private static long PairKey(RigidBody a, RigidBody b)
+        {
+            int low = Math.Min(a.GetHashCode(), b.GetHashCode());
+            int high = Math.Max(a.GetHashCode(), b.GetHashCode());
+            return ((long)low << 32) ^ (uint)high;
         }
 
         public bool Filter(IDynamicTreeProxy proxyA, IDynamicTreeProxy proxyB)
         {
             if (proxyA is RigidBodyShape shapeA && proxyB is RigidBodyShape shapeB)
             {
-                if (ragdollBodies.Contains(shapeA.RigidBody) && ragdollBodies.Contains(shapeB.RigidBody))
+                if (adjacentPairs.Contains(PairKey(shapeA.RigidBody, shapeB.RigidBody)))
                 {
                     return false;
                 }
@@ -42,7 +60,7 @@ namespace _3D_Engine.Classes.Scenes
             world.AllowDeactivation = false;
             if (ragdollBody != null && ragdollBody.Bones.Count > 1)
             {
-                world.BroadPhaseFilter = new RagdollSelfCollisionFilter(ragdollBody.Bones);
+                world.BroadPhaseFilter = new RagdollSelfCollisionFilter(ragdollBody.Bones, ragdollBody.Joints);
             }
         }
 
