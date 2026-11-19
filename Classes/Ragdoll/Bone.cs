@@ -21,6 +21,39 @@ namespace _3D_Engine.Classes.Ragdoll
         public string name { get; set; }
         //public RigidBody RB { get; set; }
 
+        private const string BoneModelPath = "models/Raw/bone.stl";
+
+        // The raw vertices never change, and the scaled cloud only depends on the bone's
+        // visual scale, which is the same for every bone in a creature. Cloning 49 creatures
+        // per generation used to re-read and re-parse bone.stl once per bone per clone.
+        private static Vector3[] cachedRawBoneVertices;
+        private static readonly Dictionary<(float, float, float), List<JVector>> cachedScaledVertices
+            = new Dictionary<(float, float, float), List<JVector>>();
+
+        private static List<JVector> GetScaledVertices(Vector3 scale)
+        {
+            (float, float, float) key = (scale.X, scale.Y, scale.Z);
+
+            if (cachedScaledVertices.TryGetValue(key, out List<JVector> cached))
+            {
+                return cached;
+            }
+
+            if (cachedRawBoneVertices == null)
+            {
+                cachedRawBoneVertices = ModelImporter.LoadOnlyVertices(BoneModelPath);
+            }
+
+            List<JVector> verts = new List<JVector>(cachedRawBoneVertices.Length);
+            foreach (Vector3 v in cachedRawBoneVertices)
+            {
+                verts.Add(new JVector(v.X * scale.X, v.Y * scale.Y, v.Z * scale.Z));
+            }
+
+            cachedScaledVertices[key] = verts;
+            return verts;
+        }
+
         public Bone(World world, WorldObject visual, Vector3 position, string name)   
         {
             this.BoneID = Bone.noOfBones;
@@ -34,12 +67,8 @@ namespace _3D_Engine.Classes.Ragdoll
             RB = world.CreateRigidBody();
             RB.Friction = 0.5f;
             //RB.AddShape(new BoxShape(shapeDims*0.5f));
-            List<JVector> verts = new List<JVector>();
-            
-            foreach (Vector3 v in ModelImporter.LoadOnlyVertices("models/Raw/bone.stl"))
-            {
-                verts.Add(new JVector(v.X * visual.GetScale().X, v.Y * visual.GetScale().Y, v.Z * visual.GetScale().Z));
-            }
+            // Cached per visual scale; PointCloudShape copies the points it is given.
+            List<JVector> verts = GetScaledVertices(visual.GetScale());
             RB.Position = new JVector(position.X, position.Y, position.Z);
             RB.Orientation = ToJQuaternion(visual.GetOrientation());
             RB.AddShape(new PointCloudShape(verts));

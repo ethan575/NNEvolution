@@ -20,6 +20,15 @@ namespace _3D_Engine.Classes.Scenes
         private const int TargetPhasesPerGeneration = 3;
         private const float TargetFloorY = -9f;
 
+        // Target ring. Roughly the distance a walker can cover in one phase
+        // (20 s / 3 phases = 6.67 s), so arrivals are actually achievable.
+        private const float TargetRingMinRadius = 12f;
+        private const float TargetRingMaxRadius = 18f;
+        private const float MaxTargetRingExtent = 52f; // keep targets on the floor
+
+        // The cube model is drawn at half scale, so its collider is built at half size too.
+        private static readonly BoxShape TargetCubeShape = new BoxShape(0.5f);
+
         Game game;
 
         PhysicsObject floor;
@@ -27,6 +36,8 @@ namespace _3D_Engine.Classes.Scenes
         // jitter physics world
         List<HeadlessSimulationScene> AllSimWorlds = new List<HeadlessSimulationScene>();
         World ForegroundWorld = new World();
+        // Separate world for the target marker so no creature can collide with it.
+        World TargetWorld = new World();
 
         Shader shader;
         PhysicsServer physicsServer;
@@ -54,6 +65,8 @@ namespace _3D_Engine.Classes.Scenes
 
         private int currentPhaseIndex = 0;
         private readonly JVector[] phaseTargets = new JVector[TargetPhasesPerGeneration];
+
+        private TargetScheduleBank? activeBank;
 
         public SimulationScene(Game game) : base(game)
         {
@@ -348,23 +361,27 @@ namespace _3D_Engine.Classes.Scenes
                 backgroundPopulationHidden = !backgroundPopulationHidden;
             }
 
+            // Manual target nudging. The marker is static now (creatures must not be able to
+            // push it), so these move it directly instead of injecting velocity - otherwise
+            // the keys silently did nothing. During a generation the schedule owns the
+            // target, so nudging is only allowed before the run starts.
             float u = 0.5f;
 
-            if (game.KeyboardState.IsKeyDown(Keys.W))
+            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.W))
             {
-                TargetCube.changeVelociy(Vector3.UnitZ * u);
+                TargetCube.setPosition(TargetCube.GetPosition() + Vector3.UnitZ * u);
             }
-            if (game.KeyboardState.IsKeyDown(Keys.S))
+            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.S))
             {
-                TargetCube.changeVelociy(-Vector3.UnitZ * u);
+                TargetCube.setPosition(TargetCube.GetPosition() - Vector3.UnitZ * u);
             }
-            if (game.KeyboardState.IsKeyDown(Keys.A))
+            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.A))
             {
-                TargetCube.changeVelociy(-Vector3.UnitX * u);
+                TargetCube.setPosition(TargetCube.GetPosition() - Vector3.UnitX * u);
             }
-            if (game.KeyboardState.IsKeyDown(Keys.D))
+            if (isFirstSimulationClick && game.KeyboardState.IsKeyDown(Keys.D))
             {
-                TargetCube.changeVelociy(Vector3.UnitX * u);
+                TargetCube.setPosition(TargetCube.GetPosition() + Vector3.UnitX * u);
             }
         }
 
@@ -402,14 +419,21 @@ namespace _3D_Engine.Classes.Scenes
             floor.Scale(6, 0.5f, 6);
             floor.setPosition(new Vector3(0, -10, 0));
 
-            RigidBody RB1 = ForegroundWorld.CreateRigidBody();
+            // The target marker lives in its own world. It used to share ForegroundWorld
+            // with the creatures, which meant the foreground creature (the one whose score
+            // was "the elite") could physically shove or block the target, and every other
+            // creature then steered at the moved cube.
+            RigidBody RB1 = TargetWorld.CreateRigidBody();
             RB1.SetMassInertia(20);
-            RB1.AddShape(new BoxShape(1));
-            RB1.MotionType = MotionType.Dynamic;
+            RB1.AddShape(TargetCubeShape);
+            RB1.MotionType = MotionType.Static;
+            RB1.AffectedByGravity = false;
             TargetCube = new PhysicsObject("convex1", shader, cubeVertex, this, game, RB1, new Vector3(0, 1, 0));
+            // Note: the .stl is scaled 2x smaller than its collider, so the marker's visual
+            // size stays what it always was on screen; only the collision extent changed.
             TargetCube.setMass(20f);
-            TargetCube.setObeyGravity(true);
-            TargetCube.Scale(0.5f);
+            TargetCube.setObeyGravity(false);
+            TargetCube.Scale(0.25f);
             TargetCube.setPosition(5f, TargetFloorY, 35f);
 
             IsReady = true;
@@ -439,6 +463,10 @@ namespace _3D_Engine.Classes.Scenes
 
             ForegroundWorld.Clear();
             ForegroundWorld.Dispose();
+
+            TargetWorld.Clear();
+            TargetWorld.Dispose();
+
             SceneManager.CurrentScene?.AllPhysicsObjects.Clear();
         }
 
@@ -507,26 +535,17 @@ namespace _3D_Engine.Classes.Scenes
                 ? ForegroundBody.initialConfig.COMPosition
                 : JVector.Zero;
 
-            float baseAngle = rng.NextSingle() * MathF.PI * 2f;
-            float[] angles = new float[TargetPhasesPerGeneration];
-            for (int i = 0; i < TargetPhasesPerGeneration; i++)
-            {
-                angles[i] = baseAngle + i * (MathF.PI * 2f / TargetPhasesPerGeneration);
-            }
+            // Scores are only comparable between generations if the task is comparable.
+            // A bank of fixed schedules is pinned for a few generations and then rotated.
+            TargetScheduleBank bank = NNTrainer.NextScheduleBank(activeBank, BuildTargetScheduleBank);
+            activeBank = bank;
+            JVector[] schedule = bank.Schedules[GenNumber % bank.Schedules.Length];
 
-            // Shuffle phase directions so the network cannot memorize a fixed turn order from clock alone
-            for (int i = angles.Length - 1; i > 0; i--)
-            {
-                int j = rng.Next(i + 1);
-                (angles[i], angles[j]) = (angles[j], angles[i]);
-            }
+            JVector[] resolvedTargets = ResolveTargets(centre, schedule);
 
             for (int i = 0; i < TargetPhasesPerGeneration; i++)
             {
-                float radius = 32f + rng.NextSingle() * 14f; // 32..46 units away
-                float x = Math.Clamp(centre.X + MathF.Cos(angles[i]) * radius, -52f, 52f);
-                float z = Math.Clamp(centre.Z + MathF.Sin(angles[i]) * radius, -52f, 52f);
-                phaseTargets[i] = new JVector(x, TargetFloorY, z);
+                phaseTargets[i] = resolvedTargets[i];
             }
 
             currentPhaseIndex = 0;
@@ -538,8 +557,74 @@ namespace _3D_Engine.Classes.Scenes
             }
         }
 
+        /// <summary>
+        /// Builds a bank of schedules as offsets from the spawn point. Each schedule turns
+        /// the creature through <see cref="TargetPhasesPerGeneration"/> directions that are
+        /// evenly spread around the circle and then shuffled, so the network cannot read a
+        /// fixed turn order off its clock.
+        /// </summary>
+        private JVector[][] BuildTargetScheduleBank()
+        {
+            JVector[][] schedules = new JVector[TargetScheduleBank.SchedulesPerBank][];
+
+            for (int s = 0; s < schedules.Length; s++)
+            {
+                schedules[s] = new JVector[TargetPhasesPerGeneration];
+
+                float baseAngle = rng.NextSingle() * MathF.PI * 2f;
+                float[] angles = new float[TargetPhasesPerGeneration];
+                for (int i = 0; i < TargetPhasesPerGeneration; i++)
+                {
+                    angles[i] = baseAngle + i * (MathF.PI * 2f / TargetPhasesPerGeneration);
+                }
+
+                for (int i = angles.Length - 1; i > 0; i--)
+                {
+                    int j = rng.Next(i + 1);
+                    (angles[i], angles[j]) = (angles[j], angles[i]);
+                }
+
+                for (int i = 0; i < TargetPhasesPerGeneration; i++)
+                {
+                    float radius = TargetRingMinRadius
+                        + rng.NextSingle() * (TargetRingMaxRadius - TargetRingMinRadius);
+
+                    schedules[s][i] = new JVector(MathF.Cos(angles[i]), 0f, MathF.Sin(angles[i])) * radius;
+                }
+            }
+
+            return schedules;
+        }
+
+        private static JVector[] ResolveTargets(JVector centre, JVector[] offsets)
+        {
+            // Clamp the *offset length*, not X and Z independently. Independent clamping
+            // pulled targets toward whichever axis was clipped, so an off-centre spawn gave
+            // some world directions a shorter target than others - a stochastic reward for
+            // facing one way, which is what made the population pick a favourite corner.
+            float maxOffset = MaxTargetRingExtent - MathF.Max(MathF.Abs(centre.X), MathF.Abs(centre.Z));
+            if (maxOffset < 1f) maxOffset = 1f;
+
+            JVector[] resolved = new JVector[offsets.Length];
+            for (int i = 0; i < offsets.Length; i++)
+            {
+                JVector offset = offsets[i];
+                if (offset.Length() > maxOffset)
+                {
+                    offset *= maxOffset / offset.Length();
+                }
+
+                resolved[i] = new JVector(centre.X + offset.X, TargetFloorY, centre.Z + offset.Z);
+            }
+
+            return resolved;
+        }
+
         private void SetTargetCubePosition(JVector pos)
         {
+            // Teleport-only marker: static bodies accept direct position writes and update
+            // the broadphase, so the cube can never be pushed off its scheduled point.
+            TargetCube.Rbody.MotionType = MotionType.Static;
             TargetCube.setPosition(pos.X, pos.Y, pos.Z);
             TargetCube.setVelocity(Vector3.Zero);
             TargetCube.Rbody.AngularVelocity = JVector.Zero;

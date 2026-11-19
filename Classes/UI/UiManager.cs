@@ -1,4 +1,4 @@
-﻿using _3D_Engine.Classes.Scenes;
+using _3D_Engine.Classes.Scenes;
 using _3D_Engine.Classes.Signletons;
 using ImGuiNET;
 using System.Numerics;
@@ -21,6 +21,13 @@ namespace _3D_Engine.Classes.UI
 
         public static List<float> FitnessGraphValues = new List<float>() { 0 };
         public static List<float> AvgFitnessGraphValues = new List<float>() { 0 };
+
+        // Reused buffers for PlotLines. The previous code passed
+        // `ref FitnessGraphValues.ToArray()[0]`, which either fails to compile or hands
+        // ImGui a reference into a temporary that is immediately garbage, so the plot
+        // never showed live data.
+        private static float[] bestFitnessPlotBuffer = new float[1];
+        private static float[] avgFitnessPlotBuffer = new float[1];
 
         public static void OnLoad()
         {
@@ -47,24 +54,33 @@ namespace _3D_Engine.Classes.UI
                     {
                         ImGui.Text($"{text.Key}: {text.Value}");
                     }
+                    // Scale with the data, in both directions: fitness is unbounded and can
+                    // be negative, so the old hardcoded 0..100 clipped the curve and made
+                    // progress look flat.
+                    bestFitnessPlotBuffer = CopyForPlot(FitnessGraphValues, bestFitnessPlotBuffer);
+                    avgFitnessPlotBuffer = CopyForPlot(AvgFitnessGraphValues, avgFitnessPlotBuffer);
+
+                    GetPlotRange(bestFitnessPlotBuffer, out float bestMin, out float bestMax);
+                    GetPlotRange(avgFitnessPlotBuffer, out float avgMin, out float avgMax);
+
                     ImGui.PlotLines(
                         label: "Best Fitness",
-                        values: ref FitnessGraphValues.ToArray()[0],
-                        values_count: FitnessGraphValues.Count,
+                        values: ref bestFitnessPlotBuffer[0],
+                        values_count: bestFitnessPlotBuffer.Length,
                         values_offset: 0,
                         overlay_text: "",
-                        scale_min: 0.0f,
-                        scale_max: 100.0f,
+                        scale_min: bestMin,
+                        scale_max: bestMax,
                         graph_size: new Vector2(0, 100) // 0 width fills available window space
                                            );
                     ImGui.PlotLines(
                         label: "Average Fitness",
-                        values: ref AvgFitnessGraphValues.ToArray()[0],
-                        values_count: AvgFitnessGraphValues.Count,
+                        values: ref avgFitnessPlotBuffer[0],
+                        values_count: avgFitnessPlotBuffer.Length,
                         values_offset: 0,
                         overlay_text: "",
-                        scale_min: 0.0f,
-                        scale_max: 100.0f,
+                        scale_min: avgMin,
+                        scale_max: avgMax,
                         graph_size: new Vector2(0, 100) // 0 width fills available window space
                                            );
 
@@ -124,6 +140,55 @@ namespace _3D_Engine.Classes.UI
         {
             FitnessGraphValues = new List<float> { 0 };
             AvgFitnessGraphValues = new List<float> { 0 };
+        }
+
+        private static void GetPlotRange(float[] values, out float min, out float max)
+        {
+            min = 0f;
+            max = 1f;
+            bool first = true;
+
+            for (int i = 0; i < values.Length; i++)
+            {
+                if (!float.IsFinite(values[i]))
+                {
+                    continue;
+                }
+
+                if (first)
+                {
+                    min = values[i];
+                    max = values[i];
+                    first = false;
+                }
+                else
+                {
+                    if (values[i] < min) min = values[i];
+                    if (values[i] > max) max = values[i];
+                }
+            }
+
+            // Keep a visible span so a flat curve does not collapse the axis.
+            float span = max - min;
+            float padding = MathF.Max(span * 0.1f, 1f);
+            min -= padding;
+            max += padding;
+        }
+
+        private static float[] CopyForPlot(List<float> values, float[] buffer)
+        {
+            if (values == null || values.Count == 0)
+            {
+                return buffer.Length > 0 ? buffer : new float[1];
+            }
+
+            if (buffer.Length != values.Count)
+            {
+                buffer = new float[values.Count];
+            }
+
+            values.CopyTo(buffer);
+            return buffer;
         }
     }
 }

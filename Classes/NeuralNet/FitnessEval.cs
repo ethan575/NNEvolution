@@ -19,9 +19,6 @@ namespace _3D_Engine.Classes.NeuralNet
 
     public static class Objectives
     {
-        // maximum distance from the target position for relativity
-        public static float MaxDistanceFromPopulation = float.MinValue;
-
         public static float EvalProgressToTarget(JVector initialPosition, JVector finalPosition, JVector targetPosition)
         {
             float startDx = targetPosition.X - initialPosition.X;
@@ -46,46 +43,58 @@ namespace _3D_Engine.Classes.NeuralNet
 
         public static float EvalMultiPhaseTargetFollowing(RagdollBody ragdoll)
         {
-            if (ragdoll.PhaseProgressMeters.Count == 0)
+            // NOTE: progress must be scored *relative to the phase's starting distance*.
+            // Raw metres are dominated by walking speed: a creature that merely drifts fast
+            // in one fixed direction used to out-score one that actually steers towards the
+            // target. Relative progress is bounded to [-1, +1] per phase, so speed alone
+            // can never earn anything and "arrived" always beats "moved a long way".
+            if (ragdoll.PhaseProgressMeters.Count == 0 || ragdoll.PhaseStartDistances.Count == 0)
             {
-                return 20f * EvalProgressToTarget(ragdoll.initialPos, ragdoll.COMPosition, ragdoll.TargetPosition);
+                // Same scale as the per-phase path (at most TargetPhasesPerGeneration units),
+                // so an interrupted generation cannot score ~20x its real value.
+                float relative = EvalProgressToTarget(ragdoll.initialPos, ragdoll.COMPosition, ragdoll.TargetPosition);
+                return 3f * relative;
             }
 
-            // moving towards and away from a target must have different consequences
-            float positiveSum = 0f;
-            float negativeSum = 0f;
-            float minPhase = float.MaxValue; // smallest value encountered
+            float total = 0f;
+            int count = Math.Min(ragdoll.PhaseProgressMeters.Count, ragdoll.PhaseStartDistances.Count);
 
-            foreach (float progressVal in ragdoll.PhaseProgressMeters)
+            for (int i = 0; i < count; i++)
             {
-                if (progressVal >= 0f)
-                    positiveSum += progressVal;
-                else
-                    negativeSum += progressVal;
+                float startDistance = ragdoll.PhaseStartDistances[i];
+                if (startDistance < 1e-3f)
+                {
+                    continue;
+                }
 
-                if (progressVal < minPhase)
-                    minPhase = progressVal;
+                // -1 = walked directly away from the target, +1 = arrived at it.
+                total += Math.Clamp(ragdoll.PhaseProgressMeters[i] / startDistance, -1f, 1f);
             }
 
-            // Reward net movement toward targets while favoring moving in all 4 directions
-            float minPosBonus = MathF.Max(0f, minPhase); // smallest positive progress give bonus
-            float arrivalBonus = ragdoll.PhasesReachedCount * 2f;
-
-            return positiveSum + (0.5f * negativeSum) + (2.0f * minPosBonus) + arrivalBonus;
+            // Arrival must dominate everything else. Reaching a target also implies
+            // roughly +1 relative progress, so one arrival is worth about as much as
+            // four phases of perfect-but-unfinished tracking.
+            return total + 4f * ragdoll.PhasesReachedCount;
         }
 
-        public static float EvalEnergyUsed(float EnergyUsed)
+        public static float EvalEnergyUsed(float EnergyUsed, int stepsTaken)
         {
-            if (EnergyUsed == 0)
+            if (stepsTaken <= 0)
                 return 0;
-            return 1f / (1f + EnergyUsed); // less energy used = higher fitness
+
+            // EnergyUsed is a sum over every control step, so it has to be normalised by
+            // the number of steps or the score is identically ~0 for any real creature.
+            float meanEffort = EnergyUsed / stepsTaken;
+            return 1f / (1f + meanEffort);
         }
 
         public static float EvalTimeTaken(float TimeTaken, bool reached)
         {
             if (TimeTaken <= 0 || !reached)
                 return 0;
-            return 1f / (1f + TimeTaken); // less time taken = higher fitness
+
+            // ~1.0 for an instant arrival, ~0.25 for one that takes the whole phase.
+            return 1f / (1f + TimeTaken);
         }
 
     }
